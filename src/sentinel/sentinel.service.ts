@@ -26,7 +26,7 @@ export class SentinelService {
       query: {
         'eo:cloud_cover': { lt: 30 },
       },
-      limit: 10, // Pedimos las primeras 10 para ordenarlas localmente
+      limit: 10,
     };
 
     let response;
@@ -43,18 +43,16 @@ export class SentinelService {
       throw new HttpException(`Error AWS STAC: ${apiError}`, HttpStatus.BAD_GATEWAY);
     }
 
-    // La petición a AWS fue exitosa, validamos los resultados
     const data = response.data;
 
     if (!data.features || data.features.length === 0) {
-      this.logger.warn(`No hay imágenes para ${timeRange}. Las imágenes L2A de Sentinel-2 suelen estar disponibles post-2017.`);
+      this.logger.warn(`No hay imágenes para ${timeRange}.`);
       throw new HttpException(
         'No hay imágenes satelitales despejadas en esta fecha. (Sugerencia: prueba con un año más reciente, ej. 2023)', 
         HttpStatus.NOT_FOUND
       );
     }
 
-    // Ordenamos en JavaScript por porcentaje de nubosidad (la más limpia primero)
     const sortedFeatures = data.features.sort((a: any, b: any) => {
        return (a.properties['eo:cloud_cover'] || 100) - (b.properties['eo:cloud_cover'] || 100);
     });
@@ -62,7 +60,8 @@ export class SentinelService {
     const bestItem = sortedFeatures[0];
     const selfLink = bestItem.links.find((l: any) => l.rel === 'self').href;
 
-    const tileUrl = `https://titiler.xyz/stac/tiles/WebMercatorQuad/{z}/{x}/{y}?url=${encodeURIComponent(selfLink)}&assets=visual&color_formula=gamma+r+1.2+g+1.2+b+1.2`;
+    // Agregamos resampling=bilinear para suavizar la pixelación en acercamientos profundos
+    const tileUrl = `https://titiler.xyz/stac/tiles/WebMercatorQuad/{z}/{x}/{y}?url=${encodeURIComponent(selfLink)}&assets=red&assets=green&assets=blue&rescale=0,3000&resampling=bilinear`;
 
     this.logger.log(`¡Éxito! Imagen seleccionada: ${bestItem.id} con ${bestItem.properties['eo:cloud_cover']}% de nubes.`);
 
