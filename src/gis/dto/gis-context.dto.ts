@@ -61,6 +61,13 @@ export interface DictamenSpatialSummary {
   };
 }
 
+export interface GisTimingsMs {
+  totalMs: number;
+  r2FetchByFileMs: Record<string, number>;
+  spatialProcessByPlanoMs: Record<string, number>;
+  payloadBytes?: number;
+}
+
 export interface GisContextResponseDto {
   success: boolean;
   cached: boolean;
@@ -78,6 +85,7 @@ export interface GisContextResponseDto {
     };
   };
   summary: DictamenSpatialSummary;
+  timingsMs?: GisTimingsMs;
 }
 
 export interface ParsedPolygonSummary {
