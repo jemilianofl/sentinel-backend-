@@ -1,31 +1,32 @@
 # Etapa 1: Construcción
-FROM node:20-alpine AS builder
+FROM node:22-slim AS builder
 
 WORKDIR /app
 
-# Instalar dependencias
+# Copiar manifiestos de dependencias
 COPY package*.json ./
-RUN npm ci
 
-# Copiar el código fuente y construir la aplicación
+# Instalar todas las dependencias (incluyendo devDependencies para nest build)
+# y omitir scripts de husky/git que fallan dentro del contenedor
+RUN npm ci --include=dev --ignore-scripts
+
+# Copiar código fuente y compilar
 COPY . .
 RUN npm run build
 
-# Etapa 2: Producción
-FROM node:20-alpine
+# Dejar solo dependencias de producción
+RUN npm prune --omit=dev --ignore-scripts
+
+# Etapa 2: Ejecución ligera en producción
+FROM node:22-slim AS runner
 
 WORKDIR /app
+ENV NODE_ENV=production
 
-# Copiar solo los archivos necesarios de la etapa de construcción
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 
-# Variables de entorno por defecto
-ENV NODE_ENV=production
-ENV PORT=3000
-
 EXPOSE 3000
 
-# Iniciar la aplicación
 CMD ["npm", "run", "start:prod"]
