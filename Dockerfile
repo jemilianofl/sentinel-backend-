@@ -6,9 +6,8 @@ WORKDIR /app
 # Copiar manifiestos de dependencias
 COPY package*.json ./
 
-# Instalar todas las dependencias (incluyendo devDependencies para nest build)
-# y omitir scripts de husky/git que fallan dentro del contenedor
-RUN npm ci --include=dev --ignore-scripts
+# Instalar dependencias resolviendo paquetes opcionales nativos de Linux
+RUN npm install --include=dev --ignore-scripts --no-audit --no-fund
 
 # Copiar código fuente y compilar
 COPY . .
