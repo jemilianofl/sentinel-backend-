@@ -1,0 +1,96 @@
+import type {
+  Feature,
+  FeatureCollection,
+  Geometry,
+  Polygon,
+  MultiPolygon,
+} from 'geojson';
+
+export type LayerFilterMode = 'intersect' | 'buffer10km';
+
+export interface GisContextRequestDto {
+  geometry:
+    | FeatureCollection
+    | Feature<Polygon | MultiPolygon>
+    | Polygon
+    | MultiPolygon;
+  filterMode?: LayerFilterMode;
+  planos?: number[];
+  vegSerie?: string;
+  clipToBbox?: boolean;
+}
+
+export interface GisLayerFeatureProperties {
+  _color?: string;
+  _title?: string;
+  _layerId?: string;
+  _siteName?: string;
+  _type?: string;
+  _subtitle?: string;
+  _weight?: number;
+  _opacity?: number;
+  [key: string]: unknown;
+}
+
+export type GisTypedFeature = Feature<Geometry, GisLayerFeatureProperties>;
+
+export interface DictamenSpatialSummary {
+  areaTotalM2: number;
+  areaTotalHa: number;
+  ecologiaPredio: {
+    layerId: string;
+    title: string;
+    siteName: string;
+  }[];
+  vegetacionPredio: string[];
+  climasPredio: string[];
+  edafologiaPredio: {
+    grupo: string;
+    claveWrb?: string;
+    textura?: string;
+    profundidadEstimada: string;
+  }[];
+  hidrologiaPredio: {
+    regionHidrologica?: string;
+    cuenca?: string;
+    subcuenca?: string;
+    claveSubcuenca?: string;
+    ordenStrahlerMaximo: number | null;
+    corrientesCercanasCount: number;
+    cuerposAguaCount: number;
+  };
+}
+
+export interface GisContextResponseDto {
+  success: boolean;
+  cached: boolean;
+  filterMode: LayerFilterMode;
+  layers: {
+    eco?: GisTypedFeature[];
+    veg?: GisTypedFeature[];
+    climate?: GisTypedFeature[];
+    edafologia?: GisTypedFeature[];
+    hidrologia?: {
+      cuencas: GisTypedFeature[];
+      subcuencas: GisTypedFeature[];
+      cuerposAgua: GisTypedFeature[];
+      corrientes: GisTypedFeature[];
+    };
+  };
+  summary: DictamenSpatialSummary;
+}
+
+export interface ParsedPolygonSummary {
+  polyId: string;
+  name: string;
+  areaM2: number;
+  areaHa: number;
+}
+
+export interface ParsePolygonResponseDto {
+  success: boolean;
+  featureCollection: FeatureCollection;
+  polygons: ParsedPolygonSummary[];
+  totalAreaM2: number;
+  totalAreaHa: number;
+}
