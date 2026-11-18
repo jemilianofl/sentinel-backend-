@@ -29,42 +29,43 @@ export class SentinelController {
     return await this.sentinelService.getBestImagery(latitude, longitude, date);
   }
 
-  @Get('historical')
-  async getHistoricalImagery(
+  @Get('annual')
+  async getAnnualImagery(
     @Query('lat') lat: string,
     @Query('lng') lng: string,
-    @Query('date') date: string,
-    @Query('windowDays') windowDays?: string,
-    @Query('maxCloud') maxCloud?: string,
+    @Query('year') year: string,
     @Query('collection') collection?: SatelliteCollectionOption,
     @Query('preset') preset?: SpectralPreset,
   ) {
-    if (!lat || !lng || !date) {
-      throw new BadRequestException('Faltan parámetros requeridos: lat, lng, date');
+    if (!lat || !lng || !year) {
+      throw new BadRequestException('Faltan parámetros requeridos: lat, lng, year');
     }
 
     const latitude = Number.parseFloat(lat);
     const longitude = Number.parseFloat(lng);
+    const targetYear = Number.parseInt(year, 10);
+    const currentYear = new Date().getUTCFullYear();
 
-    if (Number.isNaN(latitude) || Number.isNaN(longitude)) {
-      throw new BadRequestException('Coordenadas inválidas');
+    if (
+      Number.isNaN(latitude) ||
+      Number.isNaN(longitude) ||
+      Number.isNaN(targetYear) ||
+      targetYear < 1984 ||
+      targetYear > currentYear
+    ) {
+      throw new BadRequestException('Coordenadas o año inválidos');
     }
 
-    const parsedWindow = windowDays ? Math.min(Math.max(Number.parseInt(windowDays, 10) || 60, 5), 365) : 60;
-    const parsedCloud = maxCloud ? Math.min(Math.max(Number.parseInt(maxCloud, 10) || 40, 5), 100) : 40;
     const validCollection: SatelliteCollectionOption =
-      collection === 'sentinel-2-l2a' || collection === 'landsat-c2-l2' || collection === 'all'
-        ? collection
-        : 'sentinel-2-l2a';
-    const validPreset: SpectralPreset =
-      preset === 'rgb' || preset === 'nir' || preset === 'swir' ? preset : 'rgb';
+      collection === 'landsat-c2-l2' ? 'landsat-c2-l2' : 'sentinel-2-l2a';
 
-    return await this.sentinelService.searchHistoricalScenes({
+    const validPreset: SpectralPreset =
+      preset === 'nir' || preset === 'swir' || preset === 'ndvi' ? preset : 'rgb';
+
+    return await this.sentinelService.getBestAnnualScene({
       lat: latitude,
       lng: longitude,
-      targetDate: date,
-      windowDays: parsedWindow,
-      maxCloud: parsedCloud,
+      year: targetYear,
       collection: validCollection,
       preset: validPreset,
     });
