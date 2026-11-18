@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { NestFactory } from '@nestjs/core';
+import compression from 'compression';
 import { json, urlencoded } from 'express';
 import { AppModule } from './app.module.js';
 
@@ -22,6 +23,7 @@ if (existsSync(envPath)) {
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  app.use(compression());
   app.enableCors();
   app.use(json({ limit: '15mb' }));
   app.use(urlencoded({ extended: true, limit: '15mb' }));
