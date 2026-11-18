@@ -86,8 +86,9 @@ interface EeClient {
   Image: (img: unknown) => EeImage;
 }
 
-interface StacFeature {
+interface AwsStacFeature {
   id: string;
+  links?: { rel: string; href: string }[];
   properties: {
     datetime: string;
     'eo:cloud_cover'?: number;
@@ -100,6 +101,8 @@ export class SentinelService implements OnModuleInit {
   private readonly logger = new Logger(SentinelService.name);
   private readonly ee = require('@google/earthengine') as EeClient;
   private readonly projectId = process.env.GEE_PROJECT_ID ?? 'flash-physics-471715-s8';
+  private readonly sceneCache = new Map<string, { expiresAt: number; scene: TemporalSceneItem }>();
+  private readonly CACHE_TTL_MS = 30 * 60 * 1000;
   private geeReady = false;
   private geeInitPromise: Promise<boolean> | null = null;
 
@@ -107,6 +110,24 @@ export class SentinelService implements OnModuleInit {
 
   async onModuleInit(): Promise<void> {
     await this.ensureGeeInitialized();
+  }
+
+  private getCachedScene(key: string): TemporalSceneItem | null {
+    const entry = this.sceneCache.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      this.sceneCache.delete(key);
+      return null;
+    }
+    return entry.scene;
+  }
+
+  private setCachedScene(key: string, scene: TemporalSceneItem): void {
+    if (this.sceneCache.size >= 150) {
+      const oldest = this.sceneCache.keys().next().value;
+      if (oldest) this.sceneCache.delete(oldest);
+    }
+    this.sceneCache.set(key, { expiresAt: Date.now() + this.CACHE_TTL_MS, scene });
   }
 
   private loadServiceAccountKey(): Record<string, unknown> | null {
@@ -140,7 +161,7 @@ export class SentinelService implements OnModuleInit {
 
       if (!privateKey) {
         this.logger.warn(
-          'No se encontró GEE_SERVICE_ACCOUNT_JSON ni gee-key.json; se usará Planetary Computer.',
+          'Variable GEE_SERVICE_ACCOUNT_JSON no configurada; se usará AWS Earth Search STAC.',
         );
         this.geeInitPromise = null;
         resolveInit(false);
@@ -188,8 +209,12 @@ export class SentinelService implements OnModuleInit {
     const point = this.ee.Geometry.Point([lng, lat]);
 
     if (collection === 'sentinel-2-l2a') {
+      // S2_SR_HARMONIZED inicia en 2017; para 2015-2016 usamos S2_HARMONIZED (L1C)
+      const geeCollectionId =
+        startDate < '2017-04-01' ? 'COPERNICUS/S2_HARMONIZED' : 'COPERNICUS/S2_SR_HARMONIZED';
+
       const col = this.ee
-        .ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .ImageCollection(geeCollectionId)
         .filterBounds(point)
         .filterDate(startDate, endDate);
       const clearCol = col.filter(this.ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 45));
@@ -334,8 +359,8 @@ export class SentinelService implements OnModuleInit {
     };
   }
 
-  // Respaldo automático con Microsoft Planetary Computer si GEE no está configurado o falla
-  private async queryPlanetaryComputerFallback(
+  // Respaldo con AWS Earth Search STAC (no bloquea IPs de Render como Planetary Computer)
+  private async queryAwsStacFallback(
     lat: number,
     lng: number,
     year: number,
@@ -344,70 +369,88 @@ export class SentinelService implements OnModuleInit {
     collection: SatelliteCollectionOption,
     preset: SpectralPreset,
   ): Promise<TemporalSceneItem | null> {
-    const stacUrl = 'https://planetarycomputer.microsoft.com/api/stac/v1/search';
-    const tileBase =
-      'https://planetarycomputer.microsoft.com/api/data/v1/item/tiles/WebMercatorQuad/{z}/{x}/{y}@1x';
+    const stacUrl = 'https://earth-search.aws.element84.com/v1/search';
 
-    const response = await firstValueFrom(
-      this.httpService.post<{ features?: StacFeature[] }>(
-        stacUrl,
-        {
-          collections: [collection],
-          intersects: { type: 'Point', coordinates: [lng, lat] },
-          datetime: `${startDate}T00:00:00Z/${endDate}T23:59:59Z`,
-          limit: 50,
-        },
-        { headers: { 'Content-Type': 'application/json' } },
-      ),
-    );
+    try {
+      const response = await firstValueFrom(
+        this.httpService.post<{ features?: AwsStacFeature[] }>(
+          stacUrl,
+          {
+            collections: [collection],
+            intersects: { type: 'Point', coordinates: [lng, lat] },
+            datetime: `${startDate}T00:00:00Z/${endDate}T23:59:59Z`,
+            limit: 40,
+          },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 10000 },
+        ),
+      );
 
-    const features = response.data?.features ?? [];
-    if (features.length === 0) return null;
+      const features = response.data?.features ?? [];
+      if (features.length === 0) return null;
 
-    const sorted = [...features].sort(
-      (a, b) => (a.properties['eo:cloud_cover'] ?? 100) - (b.properties['eo:cloud_cover'] ?? 100),
-    );
-    const best = sorted[0];
+      const sorted = [...features].sort(
+        (a, b) => (a.properties['eo:cloud_cover'] ?? 100) - (b.properties['eo:cloud_cover'] ?? 100),
+      );
+      const best = sorted[0];
+      const selfLink = best.links?.find((l) => l.rel === 'self')?.href;
+      if (!selfLink) return null;
 
-    let bandQuery = 'assets=B04&assets=B03&assets=B02&rescale=0,3000';
-    if (collection === 'sentinel-2-l2a') {
-      if (preset === 'nir') bandQuery = 'assets=B08&assets=B04&assets=B03&rescale=0,3800';
-      if (preset === 'swir') bandQuery = 'assets=B11&assets=B08&assets=B04&rescale=0,3800';
-      if (preset === 'ndvi')
-        bandQuery = 'expression=(B08-B04)/(B08+B04)&asset_as_band=true&rescale=-0.1,0.85&colormap_name=rdylgn';
-    } else {
-      bandQuery = 'assets=red&assets=green&assets=blue&rescale=7300,18200';
-      if (preset === 'nir') bandQuery = 'assets=nir08&assets=red&assets=green&rescale=7300,18200';
-      if (preset === 'swir') bandQuery = 'assets=swir16&assets=nir08&assets=red&rescale=7300,18200';
-      if (preset === 'ndvi')
-        bandQuery = 'expression=(nir08-red)/(nir08+red)&asset_as_band=true&rescale=-0.1,0.85&colormap_name=rdylgn';
+      const isLandsat = collection === 'landsat-c2-l2';
+      const rescale = isLandsat ? '7300,18200' : preset === 'rgb' ? '0,3000' : '0,3800';
+      const nirAsset = isLandsat ? 'nir08' : 'nir';
+
+      let assetsQuery = 'assets=red&assets=green&assets=blue';
+      if (preset === 'nir') assetsQuery = `assets=${nirAsset}&assets=red&assets=green`;
+      if (preset === 'swir') assetsQuery = `assets=swir16&assets=${nirAsset}&assets=red`;
+
+      const tileUrl = `https://titiler.xyz/stac/tiles/WebMercatorQuad/{z}/{x}/{y}?url=${encodeURIComponent(selfLink)}&${assetsQuery}&rescale=${rescale}&resampling=bilinear`;
+
+      return {
+        id: best.id,
+        year,
+        date: best.properties.datetime,
+        cloudCover: Number((best.properties['eo:cloud_cover'] ?? 0).toFixed(1)),
+        platform: best.properties.platform ?? collection,
+        collection,
+        tileUrl,
+      };
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Respaldo AWS STAC sin resultados (${year}): ${msg}`);
+      return null;
     }
-
-    return {
-      id: best.id,
-      year,
-      date: best.properties.datetime,
-      cloudCover: Number((best.properties['eo:cloud_cover'] ?? 0).toFixed(1)),
-      platform: best.properties.platform ?? collection,
-      collection,
-      tileUrl: `${tileBase}?collection=${collection}&item=${encodeURIComponent(best.id)}&${bandQuery}&resampling=bilinear`,
-    };
   }
 
   async getBestImagery(lat: number, lng: number, targetDate: string) {
+    const cacheKey = `tiles|${lat.toFixed(4)}|${lng.toFixed(4)}|${targetDate}`;
+    const cached = this.getCachedScene(cacheKey);
+    if (cached) {
+      return {
+        success: true,
+        tileUrl: cached.tileUrl,
+        metadata: {
+          id: cached.id,
+          date: cached.date,
+          cloudCover: cached.cloudCover,
+          platform: cached.platform,
+        },
+      };
+    }
+
     const baseDate = new Date(targetDate);
-    const start = new Date(baseDate.getTime() - 20 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-    const end = new Date(baseDate.getTime() + 20 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const start = new Date(baseDate.getTime() - 25 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const end = new Date(baseDate.getTime() + 25 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     const year = baseDate.getUTCFullYear();
 
     let scene: TemporalSceneItem | null = null;
     try {
       scene = await this.queryGeeScene(lat, lng, year, start, end, 'sentinel-2-l2a', 'rgb');
     } catch (err) {
-      this.logger.warn(`Fallo GEE en Plano 1, usando respaldo: ${String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Fallo GEE en Plano 1 (${targetDate}): ${msg}`);
     }
 
-    scene ??= await this.queryPlanetaryComputerFallback(
+    scene ??= await this.queryAwsStacFallback(
       lat,
       lng,
       year,
@@ -424,6 +467,7 @@ export class SentinelService implements OnModuleInit {
       );
     }
 
+    this.setCachedScene(cacheKey, scene);
     return {
       success: true,
       tileUrl: scene.tileUrl,
@@ -439,11 +483,17 @@ export class SentinelService implements OnModuleInit {
   async getBestAnnualScene(params: AnnualSearchParams) {
     const { lat, lng, year, collection, preset } = params;
 
-    if (collection === 'sentinel-2-l2a' && year < 2017) {
+    if (collection === 'sentinel-2-l2a' && year < 2015) {
       throw new HttpException(
-        'Copernicus Sentinel-2 SR en GEE inicia en 2017. Selecciona Landsat Histórico para años anteriores.',
+        'Copernicus Sentinel-2 inicia en 2015. Selecciona Landsat Histórico para años anteriores.',
         HttpStatus.BAD_REQUEST,
       );
+    }
+
+    const cacheKey = `annual|${lat.toFixed(4)}|${lng.toFixed(4)}|${year}|${collection}|${preset}`;
+    const cached = this.getCachedScene(cacheKey);
+    if (cached) {
+      return { success: true, scene: cached };
     }
 
     const startDate = `${year}-01-01`;
@@ -453,10 +503,11 @@ export class SentinelService implements OnModuleInit {
     try {
       scene = await this.queryGeeScene(lat, lng, year, startDate, endDate, collection, preset);
     } catch (err) {
-      this.logger.warn(`Fallo GEE (${year}), usando respaldo Planetary Computer: ${String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Fallo GEE (${year} - ${collection}): ${msg}`);
     }
 
-    scene ??= await this.queryPlanetaryComputerFallback(
+    scene ??= await this.queryAwsStacFallback(
       lat,
       lng,
       year,
@@ -473,6 +524,7 @@ export class SentinelService implements OnModuleInit {
       );
     }
 
+    this.setCachedScene(cacheKey, scene);
     return {
       success: true,
       scene,
