@@ -2,41 +2,55 @@ import {
   Controller,
   Post,
   Body,
+  Res,
   UploadedFile,
   UseInterceptors,
   BadRequestException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import type { Response } from 'express';
 import { GisService } from './gis.service.js';
 import type { GisContextRequestDto } from './dto/gis-context.dto.js';
-
-interface UploadedSpatialFile {
-  buffer: Buffer;
-  originalname: string;
-}
 
 @Controller('gis')
 export class GisController {
   constructor(private readonly gisService: GisService) {}
 
   @Post('context')
-  async getContext(@Body() body: GisContextRequestDto) {
+  async getContext(
+    @Body() body: GisContextRequestDto,
+    @Res({ passthrough: true }) res?: Response,
+  ) {
     if (!body?.geometry) {
-      throw new BadRequestException('Se requiere el campo "geometry" con el polígono GeoJSON');
+      throw new BadRequestException(
+        'Se requiere el campo "geometry" con el polígono GeoJSON a analizar',
+      );
     }
-    return await this.gisService.getSpatialContext(body);
+    const t0 = performance.now();
+    const result = await this.gisService.getSpatialContext(body);
+    const dur = (performance.now() - t0).toFixed(1);
+    res?.setHeader(
+      'Server-Timing',
+      `total;dur=${dur}, cached;desc="${result.cached ? 'HIT' : 'MISS'}"`,
+    );
+    return result;
   }
 
   @Post('parse-polygon')
   @UseInterceptors(
     FileInterceptor('file', {
-      limits: { fileSize: 25 * 1024 * 1024 }, // Máximo 25 MB
+      limits: { fileSize: 25 * 1024 * 1024 },
     }),
   )
-  async parsePolygon(@UploadedFile() file?: UploadedSpatialFile) {
+  async parsePolygon(
+    @UploadedFile()
+    file?: { buffer: Buffer; originalname: string },
+  ) {
     if (!file) {
-      throw new BadRequestException('Debes adjuntar un archivo en el campo "file"');
+      throw new BadRequestException(
+        'Debes adjuntar un archivo espacial (.geojson, .kml o .zip)',
+      );
     }
-    return await this.gisService.parseSpatialUpload(file.buffer, file.originalname);
+    return this.gisService.parseSpatialUpload(file.buffer, file.originalname);
   }
 }

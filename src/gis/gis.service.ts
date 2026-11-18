@@ -137,39 +137,52 @@ export class GisService {
 
   private clipFeatureToBbox(
     feature: GisTypedFeature,
-    clipBbox: BBox,
-    enabled: boolean,
+    bbox: BBox,
+    clipToBbox = true,
   ): GisTypedFeature {
-    if (!enabled || !feature.geometry) return feature;
+    if (!feature.geometry) return feature;
+
     const geomType = feature.geometry.type;
     if (
-      geomType !== 'Polygon' &&
-      geomType !== 'MultiPolygon' &&
-      geomType !== 'LineString' &&
-      geomType !== 'MultiLineString'
+      !clipToBbox ||
+      (geomType !== 'LineString' &&
+        geomType !== 'MultiLineString' &&
+        geomType !== 'Polygon' &&
+        geomType !== 'MultiPolygon')
     ) {
-      return feature;
+      return turf.truncate(feature, {
+        precision: 5,
+        coordinates: 2,
+      }) as GisTypedFeature;
     }
 
     try {
       const clipped = turf.bboxClip(
-        feature as Feature<Polygon | MultiPolygon | GeoJSON.LineString | GeoJSON.MultiLineString>,
-        clipBbox,
+        feature as Parameters<typeof turf.bboxClip>[0],
+        bbox,
       );
       if (
-        clipped?.geometry &&
-        'coordinates' in clipped.geometry &&
-        clipped.geometry.coordinates.length > 0
+        !clipped?.geometry ||
+        ('coordinates' in clipped.geometry &&
+          Array.isArray(clipped.geometry.coordinates) &&
+          clipped.geometry.coordinates.length === 0)
       ) {
-        return {
-          ...feature,
-          geometry: clipped.geometry,
-        };
+        return turf.truncate(feature, {
+          precision: 5,
+          coordinates: 2,
+        }) as GisTypedFeature;
       }
+
+      return turf.truncate(
+        { ...feature, geometry: clipped.geometry },
+        { precision: 5, coordinates: 2 },
+      ) as GisTypedFeature;
     } catch {
-      /* Mantener geometría original si bboxClip falla por topología compleja */
+      return turf.truncate(feature, {
+        precision: 5,
+        coordinates: 2,
+      }) as GisTypedFeature;
     }
-    return feature;
   }
 
   private safeIntersects(a: Feature, b: Feature): boolean {
