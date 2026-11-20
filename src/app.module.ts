@@ -5,10 +5,11 @@ import { SentinelService } from './sentinel/sentinel.service.js';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { GisModule } from './gis/gis.module.js';
+import { ConaguaModule } from './conagua/conagua.module.js';
 
 @Module({
-  imports: [HttpModule, GisModule],
-  controllers: [AppController, SentinelController,],
+  imports: [HttpModule, GisModule, ConaguaModule],
+  controllers: [AppController, SentinelController],
   providers: [AppService, SentinelService],
 })
 export class AppModule {}
