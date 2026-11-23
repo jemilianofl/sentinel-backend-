@@ -9,6 +9,8 @@ const require = createRequire(import.meta.url);
 
 export type SpectralPreset = 'rgb' | 'nir' | 'swir' | 'ndvi';
 export type SatelliteCollectionOption = 'sentinel-2-l2a' | 'landsat-c2-l2';
+/** [minLng, minLat, maxLng, maxLat] en EPSG:4326 */
+export type BBox = [number, number, number, number];
 
 export interface AnnualSearchParams {
   lat: number;
@@ -16,6 +18,8 @@ export interface AnnualSearchParams {
   year: number;
   collection: SatelliteCollectionOption;
   preset: SpectralPreset;
+  /** Área de interés (polígono + buffer). Si viene, la escena se elige por despeje sobre el AOI y se genera miniatura. */
+  bbox?: BBox | null;
 }
 
 export interface TemporalSceneItem {
@@ -26,6 +30,13 @@ export interface TemporalSceneItem {
   platform: string;
   collection: SatelliteCollectionOption;
   tileUrl: string;
+  /** Miniatura PNG del AOI (EPSG:4326) para la galería multitemporal. */
+  thumbUrl?: string | null;
+  bbox?: BBox | null;
+  /** % del AOI cubierto y libre de nubes/sombras (Cloud Score+), solo Sentinel-2 con bbox. */
+  aoiClearPct?: number | null;
+  /** L2A (reflectancia de superficie), L1C (TOA, 2015-2018) o L2 (Landsat). */
+  processingLevel?: string | null;
 }
 
 interface EeMapIdResult {
@@ -34,16 +45,32 @@ interface EeMapIdResult {
 }
 
 interface EeImageInfo {
+  id?: string;
   properties?: Record<string, unknown>;
 }
 
+interface EeComputedNumber {
+  gt: (n: number) => unknown;
+  gte: (n: number) => unknown;
+  multiply: (n: number) => EeComputedNumber;
+  subtract: (n: unknown) => EeComputedNumber;
+}
+
 interface EeImage {
+  select: (bands: string | string[]) => EeImage;
+  gte: (value: number) => EeImage;
+  unmask: (value: number) => EeImage;
+  set: (key: string, value: unknown) => EeImage;
+  get: (key: string) => unknown;
+  bandNames: () => { contains: (name: string) => unknown };
+  reduceRegion: (args: Record<string, unknown>) => { get: (key: string) => unknown };
   normalizedDifference: (bands: [string, string]) => EeImage;
   evaluate: (cb: (info: EeImageInfo | null, err?: string) => void) => void;
   getMapId: (
     visParams: Record<string, unknown>,
     cb: (mapId: EeMapIdResult | null, err?: string) => void,
   ) => void;
+  getThumbURL: (params: Record<string, unknown>, cb: (url: string | null, err?: string) => void) => void;
 }
 
 interface EeImageCollection {
@@ -52,9 +79,11 @@ interface EeImageCollection {
   filterBounds: (geom: unknown) => EeImageCollection;
   filterDate: (start: string, end: string) => EeImageCollection;
   filter: (filter: unknown) => EeImageCollection;
-  sort: (prop: string) => EeImageCollection;
-  size: () => { gt: (n: number) => unknown };
+  sort: (prop: string, ascending?: boolean) => EeImageCollection;
+  size: () => EeComputedNumber;
   first: () => EeImage;
+  map: (fn: (img: EeImage) => EeImage) => EeImageCollection;
+  linkCollection: (other: EeImageCollection, bands: string[]) => EeImageCollection;
 }
 
 interface EeClient {
@@ -75,14 +104,19 @@ interface EeClient {
   ) => void;
   Geometry: {
     Point: (coords: [number, number]) => unknown;
+    Rectangle: (coords: number[], proj?: string | null, geodesic?: boolean) => unknown;
   };
   Filter: {
     lt: (name: string, value: number) => unknown;
   };
+  Reducer: {
+    mean: () => unknown;
+  };
   Algorithms: {
     If: (condition: unknown, trueCase: unknown, falseCase: unknown) => unknown;
   };
-  ImageCollection: (id: string) => EeImageCollection;
+  Number: (value: unknown) => EeComputedNumber;
+  ImageCollection: (id: unknown) => EeImageCollection;
   Image: (img: unknown) => EeImage;
 }
 
@@ -95,6 +129,13 @@ interface AwsStacFeature {
     platform?: string;
   };
 }
+
+/** Umbral de píxel limpio de Cloud Score+ (el script forense usa 0.65; 0.60 es un poco más tolerante en selva). */
+const CS_CLEAR_THRESHOLD = 0.6;
+/** Lado máximo (px) de las miniaturas de la galería. */
+const THUMB_MAX_SIDE = 384;
+/** S2_SR_HARMONIZED tiene cobertura irregular en México antes de dic-2018: si hay pocas escenas L2A se usa L1C. */
+const MIN_SR_SCENES = 6;
 
 @Injectable()
 export class SentinelService implements OnModuleInit {
@@ -123,7 +164,8 @@ export class SentinelService implements OnModuleInit {
   }
 
   private setCachedScene(key: string, scene: TemporalSceneItem): void {
-    if (this.sceneCache.size >= 150) {
+    // Una serie Landsat completa son ~43 años por polígono: margen holgado
+    if (this.sceneCache.size >= 400) {
       const oldest = this.sceneCache.keys().next().value;
       if (oldest) this.sceneCache.delete(oldest);
     }
@@ -199,24 +241,113 @@ export class SentinelService implements OnModuleInit {
     return this.geeInitPromise;
   }
 
+  private bboxToGeoJson(bbox: BBox) {
+    const [minX, minY, maxX, maxY] = bbox;
+    return {
+      type: 'Polygon',
+      coordinates: [
+        [
+          [minX, minY],
+          [maxX, minY],
+          [maxX, maxY],
+          [minX, maxY],
+          [minX, minY],
+        ],
+      ],
+    };
+  }
+
+  private thumbDimensions(bbox: BBox): string {
+    const w = bbox[2] - bbox[0];
+    const h = bbox[3] - bbox[1];
+    if (w >= h) {
+      return `${THUMB_MAX_SIDE}x${Math.max(32, Math.round((THUMB_MAX_SIDE * h) / w))}`;
+    }
+    return `${Math.max(32, Math.round((THUMB_MAX_SIDE * w) / h))}x${THUMB_MAX_SIDE}`;
+  }
+
+  /**
+   * Colección Sentinel-2 del periodo: L2A si hay suficientes escenas, si no L1C.
+   * (S2_SR_HARMONIZED no existe antes de 2017 y es escasa en México hasta finales de 2018.)
+   */
+  private buildSentinelCollection(region: unknown, startDate: string, endDate: string): EeImageCollection {
+    const l1c = this.ee
+      .ImageCollection('COPERNICUS/S2_HARMONIZED')
+      .filterBounds(region)
+      .filterDate(startDate, endDate);
+
+    if (endDate < '2017-04-01') return l1c;
+
+    const sr = this.ee
+      .ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(region)
+      .filterDate(startDate, endDate);
+
+    return this.ee.ImageCollection(this.ee.Algorithms.If(sr.size().gte(MIN_SR_SCENES), sr, l1c));
+  }
+
+  /**
+   * Selección por AOI (misma lógica que evidencia_forense_sentinel.py):
+   * Cloud Score+ por píxel, fracción del AOI cubierta y despejada, se elige la escena más limpia.
+   */
+  private selectSentinelByAoi(bbox: BBox, startDate: string, endDate: string): EeImage {
+    const region = this.ee.Geometry.Rectangle([...bbox], null, false);
+    const base = this.buildSentinelCollection(region, startDate, endDate);
+    const candidates = base.filter(this.ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80));
+
+    const cs = this.ee
+      .ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED')
+      .filterBounds(region)
+      .filterDate(startDate, endDate);
+
+    const scored = candidates.linkCollection(cs, ['cs_cdf']).map((img) => {
+      // unmask(0): lo que queda fuera de la huella de la escena cuenta como NO despejado
+      const clearFraction = this.ee.Algorithms.If(
+        img.bandNames().contains('cs_cdf'),
+        img
+          .select('cs_cdf')
+          .gte(CS_CLEAR_THRESHOLD)
+          .unmask(0)
+          .reduceRegion({
+            reducer: this.ee.Reducer.mean(),
+            geometry: region,
+            scale: 20,
+            maxPixels: 1e8,
+          })
+          .get('cs_cdf'),
+        0,
+      );
+      const clear = this.ee.Number(this.ee.Algorithms.If(clearFraction, clearFraction, 0));
+      // Desempate: menor nubosidad de escena
+      const score = clear
+        .multiply(100)
+        .subtract(this.ee.Number(img.get('CLOUDY_PIXEL_PERCENTAGE')).multiply(0.01));
+      return img.set('AOI_CLEAR', clear).set('AOI_SCORE', score);
+    });
+
+    return this.ee.Image(
+      this.ee.Algorithms.If(
+        candidates.size().gt(0),
+        scored.sort('AOI_SCORE', false).first(),
+        base.sort('CLOUDY_PIXEL_PERCENTAGE').first(),
+      ),
+    );
+  }
+
   private buildGeeSelection(
     lat: number,
     lng: number,
     startDate: string,
     endDate: string,
     collection: SatelliteCollectionOption,
+    bbox?: BBox | null,
   ): EeImage {
-    const point = this.ee.Geometry.Point([lng, lat]);
+    const region = bbox ? this.ee.Geometry.Rectangle([...bbox], null, false) : this.ee.Geometry.Point([lng, lat]);
 
     if (collection === 'sentinel-2-l2a') {
-      // S2_SR_HARMONIZED inicia en 2017; para 2015-2016 usamos S2_HARMONIZED (L1C)
-      const geeCollectionId =
-        startDate < '2017-04-01' ? 'COPERNICUS/S2_HARMONIZED' : 'COPERNICUS/S2_SR_HARMONIZED';
+      if (bbox) return this.selectSentinelByAoi(bbox, startDate, endDate);
 
-      const col = this.ee
-        .ImageCollection(geeCollectionId)
-        .filterBounds(point)
-        .filterDate(startDate, endDate);
+      const col = this.buildSentinelCollection(region, startDate, endDate);
       const clearCol = col.filter(this.ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 45));
       return this.ee.Image(
         this.ee.Algorithms.If(
@@ -240,7 +371,7 @@ export class SentinelService implements OnModuleInit {
       .ImageCollection('LANDSAT/LT05/C02/T1_L2')
       .select(['SR_B3', 'SR_B2', 'SR_B1', 'SR_B4', 'SR_B5'], ['RED', 'GREEN', 'BLUE', 'NIR', 'SWIR']);
 
-    const merged = l9.merge(l8).merge(l7).merge(l5).filterBounds(point).filterDate(startDate, endDate);
+    const merged = l9.merge(l8).merge(l7).merge(l5).filterBounds(region).filterDate(startDate, endDate);
     const clearCol = merged.filter(this.ee.Filter.lt('CLOUD_COVER', 45));
 
     return this.ee.Image(
@@ -306,6 +437,45 @@ export class SentinelService implements OnModuleInit {
     };
   }
 
+  private generateGeeThumb(
+    visImage: EeImage,
+    visParams: Record<string, unknown>,
+    bbox: BBox,
+  ): Promise<string | null> {
+    return new Promise((resolveThumb) => {
+      try {
+        visImage.getThumbURL(
+          {
+            ...visParams,
+            region: this.bboxToGeoJson(bbox),
+            dimensions: this.thumbDimensions(bbox),
+            crs: 'EPSG:4326',
+            format: 'png',
+          },
+          (url, err) => {
+            if (err || !url) {
+              this.logger.warn(`No se pudo generar miniatura GEE: ${err ?? 'sin URL'}`);
+              resolveThumb(null);
+            } else {
+              resolveThumb(url);
+            }
+          },
+        );
+      } catch (err) {
+        this.logger.warn(`Error generando miniatura GEE: ${String(err)}`);
+        resolveThumb(null);
+      }
+    });
+  }
+
+  private resolveProcessingLevel(info: EeImageInfo, collection: SatelliteCollectionOption): string {
+    if (collection === 'landsat-c2-l2') return 'L2';
+    const id = info.id ?? '';
+    if (id.includes('S2_SR')) return 'L2A';
+    if (id.includes('S2_HARMONIZED')) return 'L1C';
+    return 'L2A';
+  }
+
   private async queryGeeScene(
     lat: number,
     lng: number,
@@ -314,11 +484,12 @@ export class SentinelService implements OnModuleInit {
     endDate: string,
     collection: SatelliteCollectionOption,
     preset: SpectralPreset,
+    bbox?: BBox | null,
   ): Promise<TemporalSceneItem | null> {
     const ready = await this.ensureGeeInitialized();
     if (!ready) return null;
 
-    const bestImage = this.buildGeeSelection(lat, lng, startDate, endDate, collection);
+    const bestImage = this.buildGeeSelection(lat, lng, startDate, endDate, collection, bbox);
 
     const info = await new Promise<EeImageInfo | null>((resolveEval, rejectEval) => {
       bestImage.evaluate((res, err) => {
@@ -330,12 +501,15 @@ export class SentinelService implements OnModuleInit {
     if (!info?.properties) return null;
 
     const { visImage, visParams } = this.getVisualization(bestImage, collection, preset);
-    const mapId = await new Promise<EeMapIdResult>((resolveMap, rejectMap) => {
-      visImage.getMapId(visParams, (res, err) => {
-        if (err || !res) rejectMap(new Error(err ?? 'No se pudo generar el mapa en GEE'));
-        else resolveMap(res);
-      });
-    });
+    const [mapId, thumbUrl] = await Promise.all([
+      new Promise<EeMapIdResult>((resolveMap, rejectMap) => {
+        visImage.getMapId(visParams, (res, err) => {
+          if (err || !res) rejectMap(new Error(err ?? 'No se pudo generar el mapa en GEE'));
+          else resolveMap(res);
+        });
+      }),
+      bbox ? this.generateGeeThumb(visImage, visParams, bbox) : Promise.resolve(null),
+    ]);
 
     const props = info.properties;
     const rawTime = Number(props['system:time_start']);
@@ -347,6 +521,7 @@ export class SentinelService implements OnModuleInit {
     const platform = String(props.SPACECRAFT_NAME ?? props.SPACECRAFT_ID ?? collection);
     const tileUrl =
       mapId.urlFormat ?? `https://earthengine.googleapis.com/v1/${mapId.mapid}/tiles/{z}/{x}/{y}`;
+    const rawAoiClear = Number(props.AOI_CLEAR);
 
     return {
       id: String(props['system:index'] ?? `${collection}_${year}`),
@@ -356,6 +531,10 @@ export class SentinelService implements OnModuleInit {
       platform,
       collection,
       tileUrl,
+      thumbUrl,
+      bbox: bbox ?? null,
+      aoiClearPct: Number.isFinite(rawAoiClear) ? Number((rawAoiClear * 100).toFixed(1)) : null,
+      processingLevel: this.resolveProcessingLevel(info, collection),
     };
   }
 
@@ -368,6 +547,7 @@ export class SentinelService implements OnModuleInit {
     endDate: string,
     collection: SatelliteCollectionOption,
     preset: SpectralPreset,
+    bbox?: BBox | null,
   ): Promise<TemporalSceneItem | null> {
     const stacUrl = 'https://earth-search.aws.element84.com/v1/search';
 
@@ -377,11 +557,11 @@ export class SentinelService implements OnModuleInit {
           stacUrl,
           {
             collections: [collection],
-            intersects: { type: 'Point', coordinates: [lng, lat] },
+            intersects: bbox ? this.bboxToGeoJson(bbox) : { type: 'Point', coordinates: [lng, lat] },
             datetime: `${startDate}T00:00:00Z/${endDate}T23:59:59Z`,
-            limit: 40,
+            limit: 100,
           },
-          { headers: { 'Content-Type': 'application/json' }, timeout: 10000 },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 15000 },
         ),
       );
 
@@ -403,7 +583,11 @@ export class SentinelService implements OnModuleInit {
       if (preset === 'nir') assetsQuery = `assets=${nirAsset}&assets=red&assets=green`;
       if (preset === 'swir') assetsQuery = `assets=swir16&assets=${nirAsset}&assets=red`;
 
-      const tileUrl = `https://titiler.xyz/stac/tiles/WebMercatorQuad/{z}/{x}/{y}?url=${encodeURIComponent(selfLink)}&${assetsQuery}&rescale=${rescale}&resampling=bilinear`;
+      const commonQuery = `url=${encodeURIComponent(selfLink)}&${assetsQuery}&rescale=${rescale}&resampling=bilinear`;
+      const tileUrl = `https://titiler.xyz/stac/tiles/WebMercatorQuad/{z}/{x}/{y}?${commonQuery}`;
+      const thumbUrl = bbox
+        ? `https://titiler.xyz/stac/bbox/${bbox.join(',')}/${this.thumbDimensions(bbox)}.png?${commonQuery}`
+        : null;
 
       return {
         id: best.id,
@@ -413,6 +597,10 @@ export class SentinelService implements OnModuleInit {
         platform: best.properties.platform ?? collection,
         collection,
         tileUrl,
+        thumbUrl,
+        bbox: bbox ?? null,
+        aoiClearPct: null,
+        processingLevel: isLandsat ? 'L2' : 'L2A',
       };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -481,7 +669,7 @@ export class SentinelService implements OnModuleInit {
   }
 
   async getBestAnnualScene(params: AnnualSearchParams) {
-    const { lat, lng, year, collection, preset } = params;
+    const { lat, lng, year, collection, preset, bbox } = params;
 
     if (collection === 'sentinel-2-l2a' && year < 2015) {
       throw new HttpException(
@@ -490,18 +678,21 @@ export class SentinelService implements OnModuleInit {
       );
     }
 
-    const cacheKey = `annual|${lat.toFixed(4)}|${lng.toFixed(4)}|${year}|${collection}|${preset}`;
+    const bboxKey = bbox ? bbox.map((v) => v.toFixed(5)).join(',') : 'pt';
+    const cacheKey = `annual|${lat.toFixed(4)}|${lng.toFixed(4)}|${year}|${collection}|${preset}|${bboxKey}`;
     const cached = this.getCachedScene(cacheKey);
     if (cached) {
       return { success: true, scene: cached };
     }
 
     const startDate = `${year}-01-01`;
-    const endDate = `${year}-12-31`;
+    // Año en curso: no consultar fechas futuras
+    const today = new Date().toISOString().slice(0, 10);
+    const endDate = `${year}-12-31` > today ? today : `${year}-12-31`;
 
     let scene: TemporalSceneItem | null = null;
     try {
-      scene = await this.queryGeeScene(lat, lng, year, startDate, endDate, collection, preset);
+      scene = await this.queryGeeScene(lat, lng, year, startDate, endDate, collection, preset, bbox);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.logger.warn(`Fallo GEE (${year} - ${collection}): ${msg}`);
@@ -515,6 +706,7 @@ export class SentinelService implements OnModuleInit {
       endDate,
       collection,
       preset,
+      bbox,
     );
 
     if (!scene) {
