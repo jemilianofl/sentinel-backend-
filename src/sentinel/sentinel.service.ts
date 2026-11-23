@@ -59,7 +59,7 @@ interface EeComputedNumber {
 interface EeImage {
   select: (bands: string | string[]) => EeImage;
   gte: (value: number) => EeImage;
-  unmask: (value: number) => EeImage;
+  unmask: (value: number, sameFootprint?: boolean) => EeImage;
   set: (key: string, value: unknown) => EeImage;
   get: (key: string) => unknown;
   bandNames: () => { contains: (name: string) => unknown };
@@ -301,13 +301,15 @@ export class SentinelService implements OnModuleInit {
       .filterDate(startDate, endDate);
 
     const scored = candidates.linkCollection(cs, ['cs_cdf']).map((img) => {
-      // unmask(0): lo que queda fuera de la huella de la escena cuenta como NO despejado
+      // unmask(0, false): sameFootprint=false para que lo que queda FUERA de la huella de la
+      // escena cuente como NO despejado. Con el valor por defecto (true) una escena que solo
+      // toca el borde del AOI saldría 100 % despejada (traslape de zonas UTM 15/16 en −90°).
       const clearFraction = this.ee.Algorithms.If(
         img.bandNames().contains('cs_cdf'),
         img
           .select('cs_cdf')
           .gte(CS_CLEAR_THRESHOLD)
-          .unmask(0)
+          .unmask(0, false)
           .reduceRegion({
             reducer: this.ee.Reducer.mean(),
             geometry: region,
