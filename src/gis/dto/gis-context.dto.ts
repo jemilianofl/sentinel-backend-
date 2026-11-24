@@ -102,3 +102,32 @@ export interface ParsePolygonResponseDto {
   totalAreaM2: number;
   totalAreaHa: number;
 }
+/* ---------------- Carga de coordenadas desde Excel / CSV ---------------- */
+
+export type CoordinateTemplateKind = 'geo' | 'utm';
+
+export interface TableIssueDto {
+  /** Fila como la ve el usuario en Excel (null = error del polígono completo). */
+  row: number | null;
+  message: string;
+}
+
+export interface ParseTableResponseDto {
+  success: boolean;
+  fileName: string;
+  sheetName?: string;
+  headers: string[];
+  rowCount: number;
+  /** Plantilla oficial reconocida; null = tabla libre (el usuario elige columnas en el frontend). */
+  template: CoordinateTemplateKind | null;
+  datum: string;
+  /** Solo si se reconoció la plantilla: polígonos + vértices en WGS84. */
+  featureCollection?: FeatureCollection;
+  polygonCount?: number;
+  vertexCount?: number;
+  /** Solo para tablas libres: filas para el paso de selección de columnas. */
+  rows?: Record<string, string>[];
+  rowNumbers?: number[];
+  errors: TableIssueDto[];
+  warnings: string[];
+}
