@@ -37,7 +37,22 @@ import type {
   LayerFilterMode,
   ParsedPolygonSummary,
   ParsePolygonResponseDto,
+  ParseTableResponseDto,
 } from './dto/gis-context.dto.js';
+import {
+  buildFromTemplate,
+  detectTemplate,
+  readCsvTable,
+  readXlsxTable,
+  type TabularTable,
+} from './tabular-coordinates.js';
+import { DATUMS, type DatumId } from './geodesy.js';
+
+export interface ParseTableOptions {
+  datum?: string;
+  utmZone?: string | number;
+  hemisphere?: string;
+}
 
 interface CacheEntry {
   expiresAt: number;
@@ -710,6 +725,80 @@ export class GisService {
     return response;
   }
 
+  /** 0 → A, 25 → Z, 26 → AA… (antes pasaba de "Z" a "[" con más de 26 polígonos). */
+  private letterLabel(index: number): string {
+    let n = index;
+    let label = '';
+    do {
+      label = String.fromCodePoint(65 + (n % 26)) + label;
+      n = Math.floor(n / 26) - 1;
+    } while (n >= 0);
+    return label;
+  }
+
+  /**
+   * Coordenadas desde Excel (.xlsx) o CSV. Con plantilla oficial devuelve los polígonos y
+   * vértices ya formados (en WGS84); con una tabla libre devuelve las filas para que el
+   * usuario elija las columnas en el frontend.
+   */
+  parseTableUpload(fileBuffer: Buffer, originalName: string, options: ParseTableOptions = {}): ParseTableResponseDto {
+    const lowerName = originalName.toLowerCase();
+    const datum: DatumId = options.datum && options.datum in DATUMS ? (options.datum as DatumId) : 'WGS84';
+    const zone = Number(options.utmZone);
+    const defaultZone = Number.isInteger(zone) && zone >= 1 && zone <= 60 ? zone : 15;
+    const defaultHemisphere = String(options.hemisphere ?? 'N').toUpperCase().startsWith('S') ? 'S' : 'N';
+
+    let table: TabularTable;
+    try {
+      if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.xlsm')) table = readXlsxTable(fileBuffer);
+      else if (lowerName.endsWith('.csv') || lowerName.endsWith('.txt')) table = readCsvTable(fileBuffer);
+      else if (lowerName.endsWith('.xls')) {
+        throw new BadRequestException(
+          'El formato .xls (Excel 97-2003) no es compatible. Guárdalo como .xlsx o como CSV UTF-8.',
+        );
+      } else throw new BadRequestException('Formato no soportado. Sube un archivo .xlsx o .csv');
+    } catch (error) {
+      if (error instanceof BadRequestException) throw error;
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new BadRequestException(`No se pudo leer la tabla: ${msg}`);
+    }
+
+    if (table.headers.length === 0 || table.rows.length === 0) {
+      throw new BadRequestException('La tabla está vacía: se necesita una fila de encabezados y al menos una fila de datos.');
+    }
+
+    const base = {
+      success: true,
+      fileName: originalName,
+      sheetName: table.sheetName,
+      headers: table.headers,
+      rowCount: table.rows.length,
+      datum,
+    };
+
+    const template = detectTemplate(table.headers);
+    if (!template) {
+      return { ...base, template: null, rows: table.rows, rowNumbers: table.rowNumbers, errors: [], warnings: [] };
+    }
+
+    const built = buildFromTemplate(table, template, { datum, defaultZone, defaultHemisphere });
+    if (template.kind === 'utm' && !template.zona) {
+      built.warnings.unshift(`La tabla no trae columna ZONA: se usó la zona ${defaultZone}${defaultHemisphere} para todos los vértices.`);
+    }
+    this.logger.log(
+      `Tabla ${originalName}: plantilla ${template.kind}, ${built.polygonCount} polígono(s), ${built.vertexCount} vértice(s), ${built.errors.length} error(es).`,
+    );
+    return {
+      ...base,
+      template: template.kind,
+      featureCollection: built.featureCollection,
+      polygonCount: built.polygonCount,
+      vertexCount: built.vertexCount,
+      errors: built.errors,
+      warnings: built.warnings,
+    };
+  }
+
   private async parseRawSpatialBuffer(fileBuffer: Buffer, lowerName: string): Promise<unknown> {
     if (lowerName.endsWith('.zip')) {
       const arrayBuf = fileBuffer.buffer.slice(
@@ -770,7 +859,7 @@ export class GisService {
           truncated.geometry.type === 'Polygon' ||
           truncated.geometry.type === 'MultiPolygon'
         ) {
-          const polyId = String.fromCodePoint(65 + polyIndex);
+          const polyId = this.letterLabel(polyIndex);
           polyIndex++;
           truncated.properties = {
             ...truncated.properties,

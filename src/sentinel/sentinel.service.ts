@@ -37,6 +37,8 @@ export interface TemporalSceneItem {
   aoiClearPct?: number | null;
   /** L2A (reflectancia de superficie), L1C (TOA, 2015-2018) o L2 (Landsat). */
   processingLevel?: string | null;
+  /** Origen de la escena: 'gee' (selección por AOI) o 'aws-stac' (respaldo). */
+  source?: 'gee' | 'aws-stac';
 }
 
 interface EeMapIdResult {
@@ -59,7 +61,7 @@ interface EeComputedNumber {
 interface EeImage {
   select: (bands: string | string[]) => EeImage;
   gte: (value: number) => EeImage;
-  unmask: (value: number) => EeImage;
+  unmask: (value: number, sameFootprint?: boolean) => EeImage;
   set: (key: string, value: unknown) => EeImage;
   get: (key: string) => unknown;
   bandNames: () => { contains: (name: string) => unknown };
@@ -83,7 +85,6 @@ interface EeImageCollection {
   size: () => EeComputedNumber;
   first: () => EeImage;
   map: (fn: (img: EeImage) => EeImage) => EeImageCollection;
-  linkCollection: (other: EeImageCollection, bands: string[]) => EeImageCollection;
 }
 
 interface EeClient {
@@ -108,6 +109,10 @@ interface EeClient {
   };
   Filter: {
     lt: (name: string, value: number) => unknown;
+    equals: (args: { leftField: string; rightField: string }) => unknown;
+  };
+  Join: {
+    saveFirst: (matchKey: string) => { apply: (primary: unknown, secondary: unknown, condition: unknown) => unknown };
   };
   Reducer: {
     mean: () => unknown;
@@ -120,8 +125,14 @@ interface EeClient {
   Image: (img: unknown) => EeImage;
 }
 
+interface AwsStacGeometry {
+  type: string;
+  coordinates: unknown;
+}
+
 interface AwsStacFeature {
   id: string;
+  geometry?: AwsStacGeometry | null;
   links?: { rel: string; href: string }[];
   properties: {
     datetime: string;
@@ -300,14 +311,27 @@ export class SentinelService implements OnModuleInit {
       .filterBounds(region)
       .filterDate(startDate, endDate);
 
-    const scored = candidates.linkCollection(cs, ['cs_cdf']).map((img) => {
-      // unmask(0): lo que queda fuera de la huella de la escena cuenta como NO despejado
+    // Join por system:index (equivale a linkCollection, pero funciona con cualquier versión
+    // del paquete @google/earthengine; linkCollection no existe en versiones antiguas).
+    const joined = this.ee.ImageCollection(
+      this.ee.Join.saveFirst('CS_MATCH').apply(
+        candidates,
+        cs,
+        this.ee.Filter.equals({ leftField: 'system:index', rightField: 'system:index' }),
+      ),
+    );
+
+    const scored = joined.map((img) => {
+      // unmask(0, false): sameFootprint=false para que lo que queda FUERA de la huella de la
+      // escena cuente como NO despejado. Con el valor por defecto (true) una escena que solo
+      // toca el borde del AOI saldría 100 % despejada.
       const clearFraction = this.ee.Algorithms.If(
-        img.bandNames().contains('cs_cdf'),
-        img
+        img.get('CS_MATCH'),
+        this.ee
+          .Image(img.get('CS_MATCH'))
           .select('cs_cdf')
           .gte(CS_CLEAR_THRESHOLD)
-          .unmask(0)
+          .unmask(0, false)
           .reduceRegion({
             reducer: this.ee.Reducer.mean(),
             geometry: region,
@@ -535,7 +559,45 @@ export class SentinelService implements OnModuleInit {
       bbox: bbox ?? null,
       aoiClearPct: Number.isFinite(rawAoiClear) ? Number((rawAoiClear * 100).toFixed(1)) : null,
       processingLevel: this.resolveProcessingLevel(info, collection),
+      source: 'gee',
     };
+  }
+
+  /**
+   * Fracción del bbox cubierta por la huella real de la escena STAC (malla de 7×7 puntos).
+   * Earth Search publica en `geometry` la zona con datos válidos, no el cuadro de la tesela MGRS.
+   */
+  private stacCoverage(geometry: AwsStacGeometry | null | undefined, bbox: BBox): number {
+    if (!geometry) return 0;
+    let polygons: number[][][][] = [];
+    if (geometry.type === 'Polygon') polygons = [geometry.coordinates as number[][][]];
+    else if (geometry.type === 'MultiPolygon') polygons = geometry.coordinates as number[][][][];
+    else return 0;
+
+    const inRing = (x: number, y: number, ring: number[][]): boolean => {
+      let inside = false;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const [xi, yi] = ring[i];
+        const [xj, yj] = ring[j];
+        if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+      }
+      return inside;
+    };
+    const inGeometry = (x: number, y: number) =>
+      polygons.some(
+        (poly) => poly.length > 0 && inRing(x, y, poly[0]) && !poly.slice(1).some((hole) => inRing(x, y, hole)),
+      );
+
+    const steps = 7;
+    let inside = 0;
+    for (let i = 0; i < steps; i++) {
+      for (let j = 0; j < steps; j++) {
+        const x = bbox[0] + ((bbox[2] - bbox[0]) * i) / (steps - 1);
+        const y = bbox[1] + ((bbox[3] - bbox[1]) * j) / (steps - 1);
+        if (inGeometry(x, y)) inside++;
+      }
+    }
+    return inside / (steps * steps);
   }
 
   // Respaldo con AWS Earth Search STAC (no bloquea IPs de Render como Planetary Computer)
@@ -559,6 +621,8 @@ export class SentinelService implements OnModuleInit {
             collections: [collection],
             intersects: bbox ? this.bboxToGeoJson(bbox) : { type: 'Point', coordinates: [lng, lat] },
             datetime: `${startDate}T00:00:00Z/${endDate}T23:59:59Z`,
+            query: { 'eo:cloud_cover': { lt: 60 } },
+            sortby: [{ field: 'properties.eo:cloud_cover', direction: 'asc' }],
             limit: 100,
           },
           { headers: { 'Content-Type': 'application/json' }, timeout: 15000 },
@@ -568,10 +632,24 @@ export class SentinelService implements OnModuleInit {
       const features = response.data?.features ?? [];
       if (features.length === 0) return null;
 
-      const sorted = [...features].sort(
-        (a, b) => (a.properties['eo:cloud_cover'] ?? 100) - (b.properties['eo:cloud_cover'] ?? 100),
-      );
-      const best = sorted[0];
+      const cloud = (f: AwsStacFeature) => f.properties['eo:cloud_cover'] ?? 100;
+      let best: AwsStacFeature;
+
+      if (bbox) {
+        // 1º cobertura del AOI (las teselas de borde de órbita quedan al final), 2º nubosidad
+        const ranked = features
+          .map((f) => ({ f, cov: this.stacCoverage(f.geometry, bbox) }))
+          .sort((a, b) => (Math.abs(b.cov - a.cov) > 0.01 ? b.cov - a.cov : cloud(a.f) - cloud(b.f)));
+        best = ranked[0].f;
+        const coverage = ranked[0].cov;
+        if (coverage < 0.95) {
+          this.logger.warn(
+            `AWS STAC ${year}: ninguna escena cubre completo el AOI (mejor cobertura ${(coverage * 100).toFixed(0)}%).`,
+          );
+        }
+      } else {
+        best = [...features].sort((a, b) => cloud(a) - cloud(b))[0];
+      }
       const selfLink = best.links?.find((l) => l.rel === 'self')?.href;
       if (!selfLink) return null;
 
@@ -601,6 +679,7 @@ export class SentinelService implements OnModuleInit {
         bbox: bbox ?? null,
         aoiClearPct: null,
         processingLevel: isLandsat ? 'L2' : 'L2A',
+        source: 'aws-stac',
       };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -695,7 +774,7 @@ export class SentinelService implements OnModuleInit {
       scene = await this.queryGeeScene(lat, lng, year, startDate, endDate, collection, preset, bbox);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`Fallo GEE (${year} - ${collection}): ${msg}`);
+      this.logger.warn(`Fallo GEE (${year} - ${collection}); se usará AWS STAC: ${msg}`);
     }
 
     scene ??= await this.queryAwsStacFallback(
